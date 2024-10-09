@@ -7,6 +7,7 @@ import array
 import base64
 import zipfile
 import logging
+import concurrent.futures
 from xml.etree import ElementTree as ET
 from html.parser import HTMLParser
 import requests
@@ -39,7 +40,7 @@ class ScriptParser(HTMLParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__data = None
-        self.client_params = []
+        self.client_params = {}
 
     def handle_starttag(self, tag, attrs):
         if tag == "script":
@@ -56,12 +57,12 @@ class ScriptParser(HTMLParser):
 
     def handle_script_data(self, script_data):
         logging.debug("script_data:%s ...", script_data[:40])
-        S = "window.CLIENT_PARAMS"
+        S = "initialState"
         if S not in script_data:
             return
-        after = script_data[script_data.find(S)+len(S):]
-        logging.debug("after: %s", after)
-        json_text = after[after.find("=")+1:after.find(";")]
+        j = json.loads(script_data)
+        json_text = j["props"]["pageProps"]["initialState"]
+        logging.debug("json_text: %s", json_text)
         self.client_params = json.loads(json_text.strip())
         logging.debug("client_params: %s", self.client_params)
 
@@ -115,30 +116,25 @@ class BookDownloader:
     def __init__(self, bookid, downloader, secret=None):
         self.bookid = bookid
         self.downloader = downloader
-        self.secret = self.download_secret() if secret is None else secret
+        self.book_encrypted_metadata = {}
+        self.secret = self.download_secret_and_metadata() if secret is None else secret
         assert self.secret is not None
 
-    def download_secret(self):
-        url = "https://reader.bookmate.com/%s" % self.bookid
+    def download_secret_and_metadata(self):
+        url = "https://books.yandex.ru/reader/%s" % self.bookid
         html = self.downloader.request_url(url).text
         logging.debug("html:%s ...", html[:20])
         parser = ScriptParser()
         parser.feed(html)
-        secret = parser.client_params["secret"]
+        secret = parser.client_params["global"]["userMetadata"]["secret"]
         logging.debug("secret: %s", secret)
+        self.book_encrypted_metadata = parser.client_params["page"]["bookMetadata"]
+        logging.debug("book_metadata: %s", self.book_encrypted_metadata)
         return secret
 
     def download(self):
-        encrypted_metadata = self.download_metadata(self.bookid)
-        metadata = self.decrypt_metadata(encrypted_metadata, self.secret)
+        metadata = self.decrypt_metadata(self.book_encrypted_metadata, self.secret)
         self.process_metadata(metadata)
-
-    def download_metadata(self, bookid):
-        logging.debug("download_metadata(%s)", bookid)
-        url = "https://reader.bookmate.com/p/api/v5/books/%s/metadata/v4" % bookid  # noqa: E501
-        metadata_response = self.downloader.request_url(url)
-        logging.debug("metadata_response:%s ...", metadata_response.text[:40])
-        return metadata_response.json()
 
     def decrypt_metadata(self, encrypted_metadata, secret):
         assert type(encrypted_metadata) in [dict]
@@ -175,6 +171,7 @@ class BookDownloader:
 
     def process_opf(self, uuid):
         content_file = self.downloader.path("OEBPS/content.opf")
+        fnames = []
         for event, elem in ET.iterparse(content_file, events=["start"]):
             if event != 'start':
                 continue
@@ -185,13 +182,26 @@ class BookDownloader:
             fname = elem.attrib["href"]
             if fname == "toc.ncx":
                 continue
-            logging.debug("fname:%s", fname)
-            url = "https://reader.bookmate.com/p/a/4/d/{uuid}/contents/OEBPS/{fname}".format(uuid=uuid, fname=fname)
-            try:
-                response = self.downloader.request_url(url)
-                self.downloader.save_bytes(response.content, "OEBPS/"+fname)
-            except Exception:
-                logging.warning("cannot download from '%s'", url)
+            fnames.append(fname)
+        print("Downloading book contents:")
+        content_total_parts = len(fnames)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self.download_content_part, fname, index + 1, content_total_parts, uuid, self.downloader): index
+                for index, fname in enumerate(fnames)
+            }
+
+    @staticmethod
+    def download_content_part(fname, content_part_number, content_total_parts, uuid, downloader):
+        print(f"...{fname} ({content_part_number}/{content_total_parts})")
+        logging.debug("fname:%s", fname)
+        url = "https://books.yandex.ru/reader/p/a/4/d/{uuid}/contents/OEBPS/{fname}".format(uuid=uuid, fname=fname)
+        try:
+            response = downloader.request_url(url)
+            downloader.save_bytes(response.content, "OEBPS/" + fname)
+        except Exception:
+            logging.warning("cannot download from '%s'", url)
 
     def delete_downloaded(self):
         self.downloader.delete_downloaded()
@@ -217,16 +227,19 @@ class Bookmate:
 
 
 def get_cookies():
-    if os.environ.get('BMS') is not None:
-        bms = os.environ.get('BMS')
+    if os.path.exists("cookies.json"):
+        with open("cookies.json", "r") as cookies_file:
+            cc = json.loads(cookies_file.read())
     else:
         try:
             from pycookiecheat import chrome_cookies
-            cc = chrome_cookies("https://reader.bookmate.com")
-            bms = cc["bms"]
+            cc = chrome_cookies("https://books.yandex.ru")
+            with open("cookies.json", "w") as cookies_file:
+                cookies_file.write(json.dumps(cc))
         except Exception:
-            bms = input("Enter bms cookie\n(your browser -> developer tools -> application -> bookmate.com -> bms -> Value) :")
-    return {"bms": bms}
+            print("Log in to books.yandex.ru and get session cookies from Chrome or export them in to a file 'secret.json' in JSON format.")
+            exit(0)
+    return cc
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
